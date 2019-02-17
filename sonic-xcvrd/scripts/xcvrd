@@ -15,6 +15,7 @@ try:
     import syslog
     import time
     import threading
+    import multiprocessing
     from swsscommon import swsscommon
 except ImportError, e:
     raise ImportError (str(e) + " - required module not found")
@@ -61,6 +62,8 @@ VOLT_UNIT = 'Volts'
 POWER_UNIT = 'dBm'
 BIAS_UNIT = 'mA'
 
+RUN = True
+
 #========================== Syslog wrappers ==========================
 
 def log_info(msg, also_print_to_console=False):
@@ -90,19 +93,17 @@ def log_error(msg, also_print_to_console=False):
 #========================== Signal Handling ==========================
 
 def signal_handler(sig, frame):
+    global RUN
     if sig == signal.SIGHUP:
         log_info("Caught SIGHUP - ignoring...")
-        return
     elif sig == signal.SIGINT:
         log_info("Caught SIGINT - exiting...")
-        sys.exit(128 + sig)
+        RUN = False
     elif sig == signal.SIGTERM:
         log_info("Caught SIGTERM - exiting...")
-        sys.exit(128 + sig)
+        RUN = False
     else:
         log_warning("Caught unhandled signal '" + sig + "'")
-        return
-
 
 #============ Functions to load platform-specific classes ============
 
@@ -232,6 +233,9 @@ def post_port_sfp_info_to_db(logical_port_name, table):
         ganged_port = True
 
     for physical_port in physical_port_list:
+        if not RUN:
+            break
+
         if not platform_sfputil.get_presence(physical_port):
             continue
 
@@ -268,6 +272,9 @@ def post_port_dom_info_to_db(logical_port_name, table):
         ganged_port = True
 
     for physical_port in physical_port_list:
+        if not RUN:
+            break
+
         if not platform_sfputil.get_presence(physical_port):
             continue
 
@@ -346,7 +353,62 @@ class dom_info_update_task:
 
     def task_stop(self):
         self.task_stopping_event.set()
+        self.task_timer.cancel()
         self.task_timer.join()
+
+# Process wrapper class to update sfp state info periodically
+class sfp_state_update_task:
+    def __init__(self):
+        self.task_process = None
+        self.task_stopping_event = multiprocessing.Event()
+
+    def task_worker(self, stopping_event):
+        log_info("Start SFP monitoring loop")
+
+        # Start loop to listen to the SFP change event
+        while not stopping_event.is_set():
+            status, port_dict = platform_sfputil.get_transceiver_change_event()
+            if status:
+                for key, value in port_dict.iteritems():
+                    logical_port_list = platform_sfputil.get_physical_to_logical(int(key))
+                    for logical_port in logical_port_list:
+                        if value == SFP_STATUS_INSERTED:
+                            log_info("Got SFP inserted event")
+                            rc = post_port_sfp_info_to_db(logical_port, int_tbl)
+                            # If we didn't get the sfp info, assuming the eeprom is not ready, give a try again.
+                            if rc == SFP_EEPROM_NOT_READY:
+                                log_warning("SFP EEPROM is not ready. One more try...")
+                                time.sleep(TIME_FOR_SFP_READY_SECS)
+                                post_port_sfp_info_to_db(logical_port, int_tbl)
+                            post_port_dom_info_to_db(logical_port, dom_tbl)
+                        elif value == SFP_STATUS_REMOVED:
+                            log_info("Got SFP removed event")
+                            del_port_sfp_dom_info_to_db(logical_port, int_tbl, dom_tbl)
+                        else:
+                            # TODO, SFP return error code, need handle accordingly.
+                            continue
+            else:
+                # If get_transceiver_change_event() return error, will clean up the DB and then exit
+                # TODO: next step need to define more error types to handle accordingly.
+                log_error("Method get_transceiver_change_event() returned error, exiting...")
+                os.kill(os.getppid(), signal.SIGTERM)
+                break
+
+        log_info("Stop SFP monitoring loop")
+
+    def task_run(self):
+        if self.task_stopping_event.is_set():
+            return
+
+        self.task_process = multiprocessing.Process(target=self.task_worker,args=(self.task_stopping_event,))
+        self.task_process.start()
+
+    def task_stop(self):
+        if not self.task_process.is_alive:
+            return
+
+        self.task_stopping_event.set()
+        os.kill(self.task_process.pid, signal.SIGKILL)
 
 #=============================== Main ================================
 
@@ -392,7 +454,7 @@ def main():
     sel.addSelectable(sst)
 
     # Make sure this daemon started after all port configured.
-    while True:
+    while RUN:
         (state, c) = sel.select(SELECT_TIMEOUT_MSECS)
         if state == swsscommon.Select.TIMEOUT:
             continue
@@ -414,31 +476,20 @@ def main():
     dom_info_update = dom_info_update_task(dom_tbl)
     dom_info_update.task_run()
 
-    # Start main loop to listen to the SFP change event.
-    log_info("Start main loop")
-    while True:
-        status, port_dict = platform_sfputil.get_transceiver_change_event()
-        if status:
-            for key, value in port_dict.iteritems():
-                logical_port_list = platform_sfputil.get_physical_to_logical(int(key))
-                for logical_port in logical_port_list:
-                    if value == SFP_STATUS_INSERTED:
-                        rc = post_port_sfp_info_to_db(logical_port, int_tbl)
-                        # If we didn't get the sfp info, assuming the eeprom is not ready, give a try again.
-                        if rc == SFP_EEPROM_NOT_READY:
-                            time.sleep(TIME_FOR_SFP_READY_SECS)
-                            post_port_sfp_info_to_db(logical_port, int_tbl)
-                        post_port_dom_info_to_db(logical_port, dom_tbl)
+    # Start the sfp state info update process
+    sfp_state_update = sfp_state_update_task()
+    sfp_state_update.task_run()
 
-                    elif value == SFP_STATUS_REMOVED:
-                        del_port_sfp_dom_info_to_db(logical_port, int_tbl, dom_tbl)
-                    else:
-                        # TODO, SFP return error code, need handle accordingly.
-                        continue
-        else:
-            # If get_transceiver_change_event() return error, will clean up the DB and then exit
-            # TODO: next step need to define more error types to handle accordingly.
-            break
+    # Start main loop
+    log_info("Start daemon main loop")
+
+    while RUN:
+        time.sleep(1)
+
+    log_info("Stop daemon main loop")
+
+    # Stop the sfp state info update process
+    sfp_state_update.task_stop()
 
     # Stop the dom info update timer
     dom_info_update.task_stop()
@@ -447,8 +498,8 @@ def main():
     logical_port_list = platform_sfputil.logical
     for logical_port_name in logical_port_list:
         del_port_sfp_dom_info_to_db(logical_port_name, int_tbl, dom_tbl)
-    log_error("Error: return error from get_transceiver_change_event(), exiting...")
-    return 1
+
+    log_info("Shutting down...")
 
 if __name__ == '__main__':
     main()
